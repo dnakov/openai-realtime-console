@@ -140,7 +140,13 @@ export function ConsolePage() {
     output_text_tokens: 0,
     cost: 0,
   });
+  const [optimized, setOptimized] = useState<boolean>(false)
+  const convoText = useRef<string>('')
+  const opt = useRef<boolean>(false)
   
+  useEffect(() => {
+    opt.current = optimized
+  }, [optimized])
   /**
    * Utility for formatting the timing of logs
    */
@@ -180,6 +186,8 @@ export function ConsolePage() {
    */
   const connectConversation = useCallback(async () => {
     const client = clientRef.current;
+    // @ts-ignore
+    globalThis.client = client;
     const wavRecorder = wavRecorderRef.current;
     const wavStreamPlayer = wavStreamPlayerRef.current;
 
@@ -187,7 +195,7 @@ export function ConsolePage() {
     startTimeRef.current = new Date().toISOString();
     setIsConnected(true);
     setRealtimeEvents([]);
-    setItems(client.conversation.getItems());
+    // setItems(client.conversation.getItems());
 
     // Connect to microphone
     await wavRecorder.begin();
@@ -256,7 +264,7 @@ export function ConsolePage() {
     const wavRecorder = wavRecorderRef.current;
     const wavStreamPlayer = wavStreamPlayerRef.current;
     const trackSampleOffset = await wavStreamPlayer.interrupt();
-    if (trackSampleOffset?.trackId) {
+    if (trackSampleOffset?.trackId && client.conversation.getItem(trackSampleOffset.trackId)) {
       const { trackId, offset } = trackSampleOffset;
       await client.cancelResponse(trackId, offset);
     }
@@ -389,7 +397,12 @@ export function ConsolePage() {
       isLoaded = false;
     };
   }, []);
-
+  const itemsToDelete = useRef<string[]>([])
+  const convo = useRef<{
+    role: 'user' | 'assistant'
+    text: string
+    type: 'text' | 'audio'
+  }[]>([])
   /**
    * Core RealtimeClient and audio capture setup
    * Set all of our instructions, tools, events and more
@@ -478,8 +491,56 @@ export function ConsolePage() {
       }
     );
 
+
     // handle realtime events from client + server for event logging
     client.on('realtime.event', (realtimeEvent: RealtimeEvent) => {
+      if(opt.current) {
+        if(realtimeEvent.event.type === 'conversation.item.created') {
+          itemsToDelete.current.push(realtimeEvent.event.item.id)
+          if(realtimeEvent.event.item.role === 'user' && realtimeEvent.event.item.content[0]?.type === 'input_text') {
+            convo.current.push({
+              role: 'user',
+              text: realtimeEvent.event.item.content[0].text,
+              type: 'text'
+            })
+          }
+
+        } else if(realtimeEvent.event.type === 'response.done') {
+          for(const item_id of itemsToDelete.current) {
+            client.deleteItem(item_id)
+          }
+          itemsToDelete.current.length = 0
+          client.updateSession({ instructions: `${instructions}\n\n# Previous conversation\n\n${convo.current.map(c => `${c.role}: ${c.text}`).join('\n')}` })
+        } else if (realtimeEvent.event.type === 'conversation.item.input_audio_transcription.completed') {
+          convo.current.push({
+            role: 'user',
+            text: realtimeEvent.event.transcript.replace(/\n$/, ''),
+            type: 'audio'
+          })
+        } else if (realtimeEvent.event.type === 'response.output_item.done') {
+          if(realtimeEvent.event.item.type === 'message') {
+            convo.current.push({
+              role: 'assistant',
+              text: (realtimeEvent.event.item.content[0].text || realtimeEvent.event.item.content[0].transcript).replace(/\n$/, ''),
+              type: realtimeEvent.event.item.content[0].type === 'text' ? 'text' : 'audio'
+            })
+          } else if(realtimeEvent.event.item.type === 'function_call') {
+            convo.current.push({
+              // @ts-ignore
+              role: 'function_call',
+              text: realtimeEvent.event.item.content[0].text,
+              type: 'text'
+            })
+          } else if(realtimeEvent.event.item.type === 'function_call_output') {
+            convo.current.push({
+              // @ts-ignore
+              role: 'function_call_output',
+              text: realtimeEvent.event.item.output,
+              type: 'text'
+            })
+          }
+        }
+      }
       setRealtimeEvents((realtimeEvents) => {
         const lastEvent = realtimeEvents[realtimeEvents.length - 1];
         if (lastEvent?.event.type === realtimeEvent.event.type) {
@@ -518,11 +579,13 @@ export function ConsolePage() {
       const trackSampleOffset = await wavStreamPlayer.interrupt();
       if (trackSampleOffset?.trackId) {
         const { trackId, offset } = trackSampleOffset;
-        await client.cancelResponse(trackId, offset);
+        if(client.conversation.getItem(trackId)) {
+          await client.cancelResponse(trackId, offset);
+        }
       }
     });
     client.on('conversation.updated', async ({ item, delta }: any) => {
-      const items = client.conversation.getItems();
+      const items2 = client.conversation.getItems();
       if (delta?.audio) {
         wavStreamPlayer.add16BitPCM(delta.audio, item.id);
       }
@@ -534,10 +597,25 @@ export function ConsolePage() {
         );
         item.formatted.file = wavFile;
       }
-      setItems(items);
+      setItems(items => {
+        const newItems = [...items]
+        for(let cItem of items2) {
+          let found = false
+          for(let item of newItems) {
+            if(item.id === cItem.id) {
+              item = cItem
+              found = true
+            }
+          }
+          if(!found) {
+            items.push(cItem)
+          }
+        }
+        return newItems
+      })
     });
 
-    setItems(client.conversation.getItems());
+    // setItems(client.conversation.getItems());
 
     return () => {
       // cleanup; resets to defaults
@@ -554,6 +632,12 @@ export function ConsolePage() {
         <div className="content-title">
           <img src="/openai-logomark.svg" />
           <span>realtime console</span>
+          <Toggle
+            defaultValue={false}
+            labels={['unoptimized', 'optimized']}
+            values={['false', 'true']}
+            onChange={(_, value) => setOptimized(value === 'true')}
+          />
         </div>
         <div className="content-api-key">
           {!LOCAL_RELAY_SERVER_URL && (
@@ -568,7 +652,7 @@ export function ConsolePage() {
         </div>
       </div>
       <div className="content-main">
-        <div className="content-logs">
+        {/* <div className="content-logs">
           <div className="content-block events">
             <div className="visualization">
               <div className="visualization-entry client">
@@ -645,8 +729,79 @@ export function ConsolePage() {
               })}
             </div>
           </div>
-          <div className="content-block conversation">
-            <div className="content-block-title">conversation</div>
+          <div className="content-actions">
+            <Toggle
+              defaultValue={false}
+              labels={['manual', 'vad']}
+              values={['none', 'server_vad']}
+              onChange={(_, value) => changeTurnEndType(value)}
+            />
+            <div className="spacer" />
+            {isConnected && canPushToTalk && (
+              <Button
+                label={isRecording ? 'release to send' : 'push to talk'}
+                buttonStyle={isRecording ? 'alert' : 'regular'}
+                disabled={!isConnected || !canPushToTalk}
+                onMouseDown={startRecording}
+                onMouseUp={stopRecording}
+              />
+            )}
+            <div className="spacer" />
+            <Button
+              label={isConnected ? 'disconnect' : 'connect'}
+              iconPosition={isConnected ? 'end' : 'start'}
+              icon={isConnected ? X : Zap}
+              buttonStyle={isConnected ? 'regular' : 'action'}
+              onClick={
+                isConnected ? disconnectConversation : connectConversation
+              }
+            />
+          </div>
+        </div> */}
+        <div className="content-right">
+          {/* <div className="content-block map">
+            <div className="content-block-title">get_weather()</div>
+            <div className="content-block-title bottom">
+              {marker?.location || 'not yet retrieved'}
+              {!!marker?.temperature && (
+                <>
+                  <br />
+                  🌡️ {marker.temperature.value} {marker.temperature.units}
+                </>
+              )}
+              {!!marker?.wind_speed && (
+                <>
+                  {' '}
+                  🍃 {marker.wind_speed.value} {marker.wind_speed.units}
+                </>
+              )}
+            </div>
+            <div className="content-block-body full">
+              {coords && (
+                <Map
+                  center={[coords.lat, coords.lng]}
+                  location={coords.location}
+                />
+              )}
+            </div>
+          </div>
+          <div className="content-block kv">
+            <div className="content-block-title">set_memory()</div>
+            <div className="content-block-body content-kv">
+              {JSON.stringify(memoryKv, null, 2)}
+            </div>
+          </div> */}
+          <div className='content-logs'>
+                    <div className="content-block conversation">
+            <div className="content-block-title">
+            <div className='usage'>
+              <div><b>iat:</b>{usage.input_audio_tokens}</div>
+              <div><b>oat:</b>{usage.output_audio_tokens}</div>
+              <div><b>itt:</b>{usage.input_text_tokens}</div>
+              <div><b>ott:</b>{usage.output_text_tokens}</div>
+              <span className='cost'>${usage.cost.toFixed(2)}</span>
+            </div>
+            </div>
             <div className="content-block-body" data-conversation-content>
               {!items.length && `awaiting connection...`}
               {items.map((conversationItem, i) => {
@@ -656,7 +811,7 @@ export function ConsolePage() {
                       <div>
                         {(
                           conversationItem.role || conversationItem.type
-                        ).replaceAll('_', ' ')}
+                        )}
                       </div>
                       <div
                         className="close"
@@ -708,8 +863,7 @@ export function ConsolePage() {
                 );
               })}
             </div>
-          </div>
-          <div className="content-actions">
+            <div className="content-actions">
             <Toggle
               defaultValue={false}
               labels={['manual', 'vad']}
@@ -726,6 +880,14 @@ export function ConsolePage() {
                 onMouseUp={stopRecording}
               />
             )}
+              <div className="visualization">
+              <div className="visualization-entry client">
+                <canvas ref={clientCanvasRef} />
+              </div>
+              <div className="visualization-entry server">
+                <canvas ref={serverCanvasRef} />
+              </div>
+            </div>
             <div className="spacer" />
             <Button
               label={isConnected ? 'disconnect' : 'connect'}
@@ -737,40 +899,10 @@ export function ConsolePage() {
               }
             />
           </div>
-        </div>
-        <div className="content-right">
-          <div className="content-block map">
-            <div className="content-block-title">get_weather()</div>
-            <div className="content-block-title bottom">
-              {marker?.location || 'not yet retrieved'}
-              {!!marker?.temperature && (
-                <>
-                  <br />
-                  🌡️ {marker.temperature.value} {marker.temperature.units}
-                </>
-              )}
-              {!!marker?.wind_speed && (
-                <>
-                  {' '}
-                  🍃 {marker.wind_speed.value} {marker.wind_speed.units}
-                </>
-              )}
             </div>
-            <div className="content-block-body full">
-              {coords && (
-                <Map
-                  center={[coords.lat, coords.lng]}
-                  location={coords.location}
-                />
-              )}
-            </div>
+            
           </div>
-          <div className="content-block kv">
-            <div className="content-block-title">set_memory()</div>
-            <div className="content-block-body content-kv">
-              {JSON.stringify(memoryKv, null, 2)}
-            </div>
-          </div>
+
         </div>
       </div>
     </div>
